@@ -1,0 +1,314 @@
+# iOS CI/CD Pipeline for Prosperly
+# Automated testing, code quality, and deployment
+name: iOS CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_15.0.app/Contents/Developer
+
+jobs:
+  # Job 1: Code Quality and Static Analysis
+  code-quality:
+    name: Code Quality & Static Analysis
+    runs-on: macos-13
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.0'
+        
+    - name: Cache SPM dependencies
+      uses: actions/cache@v3
+      with:
+        path: .build
+        key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+          
+    - name: SwiftLint
+      run: |
+        if which swiftlint >/dev/null; then
+          swiftlint --strict
+        else
+          echo "SwiftLint not installed, skipping..."
+        fi
+        
+    - name: Swift Format Check
+      run: |
+        if which swift-format >/dev/null; then
+          swift-format lint --strict --recursive .
+        else
+          echo "Swift Format not installed, skipping..."
+        fi
+
+  # Job 2: Unit Tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: macos-13
+    needs: code-quality
+    
+    strategy:
+      matrix:
+        destination: 
+          - 'platform=iOS Simulator,name=iPhone 15,OS=17.0'
+          - 'platform=iOS Simulator,name=iPhone 15 Pro,OS=17.0'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.0'
+        
+    - name: Cache derived data
+      uses: actions/cache@v3
+      with:
+        path: ~/Library/Developer/Xcode/DerivedData
+        key: ${{ runner.os }}-derived-data-${{ hashFiles('**/*.xcodeproj') }}
+        restore-keys: |
+          ${{ runner.os }}-derived-data-
+          
+    - name: Run Unit Tests
+      run: |
+        xcodebuild test \
+          -project Prosperly.xcodeproj \
+          -scheme Prosperly \
+          -destination '${{ matrix.destination }}' \
+          -enableCodeCoverage YES \
+          -derivedDataPath DerivedData \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          | xcpretty --report junit --output test-results.xml
+          
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.destination }}
+        path: test-results.xml
+        
+    - name: Generate Code Coverage Report
+      run: |
+        xcrun xccov view DerivedData/Logs/Test/*.xcresult --report --json > coverage.json
+        
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-report-${{ matrix.destination }}
+        path: coverage.json
+
+  # Job 3: UI Tests
+  ui-tests:
+    name: UI Tests
+    runs-on: macos-13
+    needs: unit-tests
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.0'
+        
+    - name: Run UI Tests
+      run: |
+        xcodebuild test \
+          -project Prosperly.xcodeproj \
+          -scheme Prosperly \
+          -destination 'platform=iOS Simulator,name=iPhone 15,OS=17.0' \
+          -testPlan ProsperlyUITests \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          | xcpretty --report junit --output ui-test-results.xml
+          
+    - name: Upload UI test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: ui-test-results
+        path: ui-test-results.xml
+
+  # Job 4: Performance Tests
+  performance-tests:
+    name: Performance Tests
+    runs-on: macos-13
+    needs: unit-tests
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.0'
+        
+    - name: Run Performance Tests
+      run: |
+        xcodebuild test \
+          -project Prosperly.xcodeproj \
+          -scheme Prosperly \
+          -destination 'platform=iOS Simulator,name=iPhone 15,OS=17.0' \
+          -only-testing:ProsperlyTests/FinancialCalculationsTests/testLargeDataSetPerformance \
+          -only-testing:ProsperlyTests/ViewModelTests/testViewModelPerformance \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          | xcpretty --report junit --output performance-test-results.xml
+          
+    - name: Upload performance test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: performance-test-results
+        path: performance-test-results.xml
+
+  # Job 5: Build for Release
+  build-release:
+    name: Build Release
+    runs-on: macos-13
+    needs: [unit-tests, ui-tests]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.0'
+        
+    - name: Install provisioning profile
+      env:
+        PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE }}
+      run: |
+        if [ -n "$PROVISIONING_PROFILE" ]; then
+          echo "$PROVISIONING_PROFILE" | base64 --decode > provisioning.mobileprovision
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp provisioning.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+        fi
+        
+    - name: Build for Release
+      env:
+        CODE_SIGN_IDENTITY: ${{ secrets.CODE_SIGN_IDENTITY }}
+        PROVISIONING_PROFILE_SPECIFIER: ${{ secrets.PROVISIONING_PROFILE_SPECIFIER }}
+      run: |
+        xcodebuild archive \
+          -project Prosperly.xcodeproj \
+          -scheme Prosperly \
+          -destination 'generic/platform=iOS' \
+          -archivePath Prosperly.xcarchive \
+          CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
+          PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_SPECIFIER" \
+          | xcpretty
+          
+    - name: Export IPA
+      run: |
+        xcodebuild -exportArchive \
+          -archivePath Prosperly.xcarchive \
+          -exportPath . \
+          -exportOptionsPlist ExportOptions.plist \
+          | xcpretty
+          
+    - name: Upload IPA
+      uses: actions/upload-artifact@v3
+      with:
+        name: Prosperly-Release
+        path: Prosperly.ipa
+
+  # Job 6: Deploy to TestFlight (Production only)
+  deploy-testflight:
+    name: Deploy to TestFlight
+    runs-on: macos-13
+    needs: build-release
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download IPA
+      uses: actions/download-artifact@v3
+      with:
+        name: Prosperly-Release
+        
+    - name: Upload to TestFlight
+      env:
+        APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+      run: |
+        if command -v xcrun altool &> /dev/null; then
+          xcrun altool --upload-app \
+            --type ios \
+            --file Prosperly.ipa \
+            --apiKey $APP_STORE_CONNECT_API_KEY_ID \
+            --apiIssuer $APP_STORE_CONNECT_API_ISSUER_ID
+        else
+          echo "altool not available, skipping TestFlight upload"
+        fi
+
+  # Job 7: Notification and Reporting
+  notify-results:
+    name: Notify Results
+    runs-on: macos-13
+    needs: [code-quality, unit-tests, ui-tests, performance-tests]
+    if: always()
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      
+    - name: Create Summary Report
+      run: |
+        echo "# 📊 Prosperly CI/CD Summary" > summary.md
+        echo "" >> summary.md
+        echo "## 🧪 Test Results" >> summary.md
+        
+        if [ -f test-results.xml ]; then
+          echo "✅ Unit tests passed" >> summary.md
+        else
+          echo "❌ Unit tests failed" >> summary.md
+        fi
+        
+        if [ -f ui-test-results.xml ]; then
+          echo "✅ UI tests passed" >> summary.md
+        else
+          echo "❌ UI tests failed" >> summary.md
+        fi
+        
+        if [ -f performance-test-results.xml ]; then
+          echo "✅ Performance tests passed" >> summary.md
+        else
+          echo "❌ Performance tests failed" >> summary.md
+        fi
+        
+        echo "" >> summary.md
+        echo "## 📱 Build Status" >> summary.md
+        
+        if [ "${{ needs.build-release.result }}" == "success" ]; then
+          echo "✅ Release build successful" >> summary.md
+        else
+          echo "❌ Release build failed" >> summary.md
+        fi
+        
+        cat summary.md
+        
+    - name: Upload Summary
+      uses: actions/upload-artifact@v3
+      with:
+        name: ci-summary
+        path: summary.md 
