@@ -16,7 +16,18 @@ struct SimpleSavingsGoalsView: View {
     @State private var selectedPayFrequency: PayFrequency = .weekly
     @State private var savingsPerPaycheck: String = ""
     @State private var showingCalculations = false
+    @State private var selectedGoalIndex: Int = 0
     @EnvironmentObject private var analytics: SimpleAnalyticsTracker
+    @StateObject private var dataManager = EnhancedDataManager.shared
+    
+    private var activeGoals: [EnhancedSavingsGoal] {
+        return dataManager.enhancedSavingsGoals.filter { $0.isActive }
+    }
+    
+    private var selectedGoal: EnhancedSavingsGoal? {
+        guard selectedGoalIndex < activeGoals.count else { return nil }
+        return activeGoals[selectedGoalIndex]
+    }
     
     var body: some View {
         NavigationView {
@@ -129,11 +140,49 @@ struct SimpleSavingsGoalsView: View {
                     .background(Color.gray.opacity(0.1))
                     .cornerRadius(16)
                     
+                    // Goal Selection (if multiple goals exist)
+                    if activeGoals.count > 1 {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Select Goal")
+                                .font(.headline)
+                                .fontWeight(.semibold)
+                            
+                            Picker("Goal", selection: $selectedGoalIndex) {
+                                ForEach(0..<activeGoals.count, id: \.self) { index in
+                                    Text(activeGoals[index].name).tag(index)
+                                }
+                            }
+                            .pickerStyle(SegmentedPickerStyle())
+                        }
+                        .padding()
+                        .background(Color.gray.opacity(0.1))
+                        .cornerRadius(16)
+                    }
+                    
                     // Visual Progress Meter
-                    if let goalAmount = Double(savingsGoalAmount), goalAmount > 0 {
+                    if let goal = selectedGoal {
+                        SavingsProgressMeter(
+                            goalAmount: goal.targetAmount,
+                            currentProgress: .constant(goal.progress * 100),
+                            onAmountAdded: { amount in
+                                addSavingsAmount(amount, to: goal)
+                            },
+                            onAmountRemoved: { amount in
+                                return removeSavingsAmount(amount, from: goal)
+                            }
+                        )
+                    } else if let goalAmount = Double(savingsGoalAmount), goalAmount > 0 {
+                        // Fallback to manual goal creation mode
                         SavingsProgressMeter(
                             goalAmount: goalAmount,
-                            currentProgress: $currentProgress
+                            currentProgress: $currentProgress,
+                            onAmountAdded: { amount in
+                                createAndAddToNewGoal(amount: amount, goalAmount: goalAmount)
+                            },
+                            onAmountRemoved: { amount in
+                                // Can't remove from non-existent goal
+                                return false
+                            }
                         )
                     }
                     
@@ -147,6 +196,14 @@ struct SimpleSavingsGoalsView: View {
                             savingsPerPaycheck: savingsAmount,
                             frequency: selectedPayFrequency,
                             currentProgress: currentProgress
+                        )
+                    }
+                    
+                    // Savings History Log
+                    if let goal = selectedGoal {
+                        SavingsHistoryView(
+                            goalId: goal.id,
+                            entries: dataManager.getSavingsEntries(for: goal.id)
                         )
                     }
                 }
@@ -170,6 +227,72 @@ struct SimpleSavingsGoalsView: View {
             ])
         }
     }
+    
+    private func addSavingsAmount(_ amount: Double, to goal: EnhancedSavingsGoal) {
+        dataManager.addSavingsAmount(amount, to: goal.id)
+        
+        // Track analytics
+        analytics.track(event: "savings_amount_added", category: "goal", properties: [
+            "goal_id": goal.id.uuidString,
+            "goal_name": goal.name,
+            "amount": amount,
+            "goal_progress": goal.progress,
+            "new_current_amount": goal.currentAmount + amount
+        ])
+    }
+    
+    private func removeSavingsAmount(_ amount: Double, from goal: EnhancedSavingsGoal) -> Bool {
+        let success = dataManager.removeSavingsAmount(amount, from: goal.id)
+        
+        if success {
+            // Track analytics
+            analytics.track(event: "savings_amount_removed", category: "goal", properties: [
+                "goal_id": goal.id.uuidString,
+                "goal_name": goal.name,
+                "amount": amount,
+                "previous_amount": goal.currentAmount,
+                "new_current_amount": max(0, goal.currentAmount - amount)
+            ])
+        } else {
+            // Track failed removal attempt
+            analytics.track(event: "savings_removal_failed", category: "goal", properties: [
+                "goal_id": goal.id.uuidString,
+                "goal_name": goal.name,
+                "attempted_amount": amount,
+                "current_amount": goal.currentAmount,
+                "reason": "insufficient_funds"
+            ])
+        }
+        
+        return success
+    }
+    
+    private func createAndAddToNewGoal(amount: Double, goalAmount: Double) {
+        // Create a new goal with the specified target amount
+        let newGoal = EnhancedSavingsGoal(
+            name: "My Savings Goal",
+            targetAmount: goalAmount,
+            currentAmount: 0,
+            category: .general,
+            priority: .medium
+        )
+        
+        // Add the goal to data manager
+        dataManager.addSavingsGoal(newGoal)
+        
+        // Add the initial savings amount
+        dataManager.addSavingsAmount(amount, to: newGoal.id)
+        
+        // Update local state to show the new goal
+        selectedGoalIndex = 0
+        
+        // Track analytics
+        analytics.track(event: "savings_goal_created_with_amount", category: "goal", properties: [
+            "goal_target": goalAmount,
+            "initial_amount": amount,
+            "category": newGoal.category.rawValue
+        ])
+    }
 }
 
 struct SavingsProgressMeter: View {
@@ -177,6 +300,22 @@ struct SavingsProgressMeter: View {
     @Binding var currentProgress: Double
     @State private var currentAmountText: String = ""
     @State private var isEditingAmount: Bool = false
+    @State private var showingSuccessMessage: Bool = false
+    @State private var showingRemovalMessage: Bool = false
+    @State private var lastAddedAmount: Double = 0
+    @State private var lastRemovedAmount: Double = 0
+    @State private var isRemovalMode: Bool = false
+    
+    // Callbacks for amount changes
+    let onAmountAdded: ((Double) -> Void)?
+    let onAmountRemoved: ((Double) -> Bool)?
+    
+    init(goalAmount: Double, currentProgress: Binding<Double>, onAmountAdded: ((Double) -> Void)? = nil, onAmountRemoved: ((Double) -> Bool)? = nil) {
+        self.goalAmount = goalAmount
+        self._currentProgress = currentProgress
+        self.onAmountAdded = onAmountAdded
+        self.onAmountRemoved = onAmountRemoved
+    }
     
     private var currentAmount: Double {
         goalAmount * (currentProgress / 100)
@@ -191,6 +330,37 @@ struct SavingsProgressMeter: View {
             Text("Visual Savings Meter")
                 .font(.headline)
                 .fontWeight(.semibold)
+            
+            // Success Messages
+            if showingSuccessMessage {
+                HStack {
+                    Image(systemName: "plus.circle.fill")
+                        .foregroundColor(.green)
+                    Text("Added $\(lastAddedAmount, specifier: "%.2f") to your savings!")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                }
+                .padding()
+                .background(Color.green.opacity(0.1))
+                .cornerRadius(8)
+                .transition(.slide)
+                .animation(.easeInOut(duration: 0.3), value: showingSuccessMessage)
+            }
+            
+            if showingRemovalMessage {
+                HStack {
+                    Image(systemName: "minus.circle.fill")
+                        .foregroundColor(.orange)
+                    Text("Removed $\(lastRemovedAmount, specifier: "%.2f") from your savings!")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                }
+                .padding()
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(8)
+                .transition(.slide)
+                .animation(.easeInOut(duration: 0.3), value: showingRemovalMessage)
+            }
             
             VStack(spacing: 12) {
                 // Progress Circle
@@ -225,9 +395,31 @@ struct SavingsProgressMeter: View {
                     }
                 }
                 
+                // Mode Toggle
+                VStack(spacing: 8) {
+                    HStack {
+                        Text("Action Mode:")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        
+                        Spacer()
+                    }
+                    
+                    Picker("Mode", selection: $isRemovalMode) {
+                        Label("Add Savings", systemImage: "plus.circle")
+                            .tag(false)
+                        Label("Remove Savings", systemImage: "minus.circle")
+                            .tag(true)
+                    }
+                    .pickerStyle(SegmentedPickerStyle())
+                    .onChange(of: isRemovalMode) { _, _ in
+                        currentAmountText = ""
+                    }
+                }
+                
                 // Direct Amount Input
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Enter Current Savings Amount:")
+                    Text(isRemovalMode ? "Enter Amount to Remove:" : "Enter Amount to Add:")
                         .font(.subheadline)
                         .fontWeight(.medium)
                     
@@ -241,20 +433,20 @@ struct SavingsProgressMeter: View {
                             .font(.title3)
                             .textFieldStyle(RoundedBorderTextFieldStyle())
                             .onSubmit {
-                                updateProgressFromAmount()
+                                processAmountInput()
                             }
                             .onChange(of: currentAmountText) { _, _ in
                                 isEditingAmount = true
                             }
                         
-                        Button("Update") {
-                            updateProgressFromAmount()
+                        Button(isRemovalMode ? "Remove" : "Add") {
+                            processAmountInput()
                         }
                         .font(.subheadline)
                         .fontWeight(.semibold)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
-                        .background(Color.blue)
+                        .background(isRemovalMode ? Color.orange : Color.blue)
                         .foregroundColor(.white)
                         .cornerRadius(8)
                         .disabled(currentAmountText.isEmpty)
@@ -323,15 +515,73 @@ struct SavingsProgressMeter: View {
         }
     }
     
-    private func updateProgressFromAmount() {
-        guard let amount = Double(currentAmountText), amount >= 0 else { return }
+    private func processAmountInput() {
+        guard let amount = Double(currentAmountText), amount > 0 else { return }
         
-        let clampedAmount = min(amount, goalAmount) // Don't allow more than the goal
-        let newProgress = goalAmount > 0 ? (clampedAmount / goalAmount) * 100 : 0
+        if isRemovalMode {
+            // Handle removal
+            if let onAmountRemoved = onAmountRemoved {
+                let success = onAmountRemoved(amount)
+                if success {
+                    lastRemovedAmount = amount
+                    currentAmountText = ""
+                    isEditingAmount = false
+                    showRemovalMessage()
+                } else {
+                    // Show error feedback for invalid removal
+                    showRemovalError()
+                }
+            }
+        } else {
+            // Handle addition
+            lastAddedAmount = amount
+            onAmountAdded?(amount)
+            currentAmountText = ""
+            isEditingAmount = false
+            showSuccessMessage()
+        }
+    }
+    
+    private func showSuccessMessage() {
+        showingSuccessMessage = true
         
-        currentProgress = newProgress
-        currentAmountText = String(format: "%.2f", clampedAmount)
-        isEditingAmount = false
+        // Add haptic feedback
+        #if os(iOS)
+        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+        impactFeedback.impactOccurred()
+        #endif
+        
+        // Hide success message after 3 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            showingSuccessMessage = false
+        }
+    }
+    
+    private func showRemovalMessage() {
+        showingRemovalMessage = true
+        
+        // Add haptic feedback
+        #if os(iOS)
+        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+        impactFeedback.impactOccurred()
+        #endif
+        
+        // Hide removal message after 3 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            showingRemovalMessage = false
+        }
+    }
+    
+    private func showRemovalError() {
+        // Add error haptic feedback
+        #if os(iOS)
+        let notificationFeedback = UINotificationFeedbackGenerator()
+        notificationFeedback.notificationOccurred(.error)
+        #endif
+        
+        // Could add an error message state here if needed
+        // For now, just clear the input to indicate invalid amount
+        currentAmountText = ""
     }
 }
 
@@ -432,5 +682,125 @@ struct SavingsCalculationsView: View {
         .padding()
         .background(Color.gray.opacity(0.1))
         .cornerRadius(16)
+    }
+}
+
+struct SavingsHistoryView: View {
+    let goalId: UUID
+    let entries: [SavingsEntry]
+    @State private var showingAllEntries = false
+    
+    private var displayedEntries: [SavingsEntry] {
+        return showingAllEntries ? entries : Array(entries.prefix(5))
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Savings History")
+                    .font(.headline)
+                    .fontWeight(.semibold)
+                
+                Spacer()
+                
+                if entries.count > 5 {
+                    Button(showingAllEntries ? "Show Less" : "Show All (\(entries.count))") {
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            showingAllEntries.toggle()
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundColor(.blue)
+                }
+            }
+            
+            if entries.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "list.bullet")
+                        .font(.title2)
+                        .foregroundColor(.gray)
+                    
+                    Text("No savings entries yet")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 20)
+            } else {
+                LazyVStack(spacing: 8) {
+                    ForEach(displayedEntries) { entry in
+                        SavingsEntryRow(entry: entry)
+                    }
+                }
+            }
+        }
+        .padding()
+        .background(Color.gray.opacity(0.1))
+        .cornerRadius(16)
+    }
+}
+
+struct SavingsEntryRow: View {
+    let entry: SavingsEntry
+    
+    private var entryColor: Color {
+        switch entry.type {
+        case .addition:
+            return .green
+        case .removal:
+            return .orange
+        }
+    }
+    
+    private var entryIcon: String {
+        switch entry.type {
+        case .addition:
+            return "plus.circle.fill"
+        case .removal:
+            return "minus.circle.fill"
+        }
+    }
+    
+    private var entryPrefix: String {
+        switch entry.type {
+        case .addition:
+            return "+"
+        case .removal:
+            return "-"
+        }
+    }
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: entryIcon)
+                .font(.title3)
+                .foregroundColor(entryColor)
+            
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("\(entryPrefix)$\(entry.amount, specifier: "%.2f")")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                        .foregroundColor(entryColor)
+                    
+                    Spacer()
+                    
+                    Text(entry.date, style: .date)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                
+                if let notes = entry.notes, !notes.isEmpty {
+                    Text(notes)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(entryColor.opacity(0.05))
+        .cornerRadius(8)
     }
 } 

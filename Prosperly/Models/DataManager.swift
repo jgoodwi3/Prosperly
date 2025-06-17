@@ -425,6 +425,50 @@ public struct AutomaticContribution: Codable {
     }
 }
 
+public enum SavingsEntryType: String, CaseIterable, Codable {
+    case addition = "Addition"
+    case removal = "Removal"
+    
+    public var icon: String {
+        switch self {
+        case .addition: return "plus.circle.fill"
+        case .removal: return "minus.circle.fill"
+        }
+    }
+    
+    public var color: String {
+        switch self {
+        case .addition: return "#4CAF50" // Green
+        case .removal: return "#FF9800" // Orange
+        }
+    }
+}
+
+public struct SavingsEntry: Identifiable, Codable {
+    public let id: UUID
+    public let goalId: UUID
+    public let amount: Double
+    public let type: SavingsEntryType
+    public let date: Date
+    public let notes: String?
+    
+    public init(
+        id: UUID = UUID(),
+        goalId: UUID,
+        amount: Double,
+        type: SavingsEntryType = .addition,
+        date: Date = Date(),
+        notes: String? = nil
+    ) {
+        self.id = id
+        self.goalId = goalId
+        self.amount = amount
+        self.type = type
+        self.date = date
+        self.notes = notes
+    }
+}
+
 // MARK: - Enhanced Analytics Classes
 
 // Enhanced Analytics Tracker with local persistence
@@ -526,6 +570,7 @@ public class EnhancedDataManager: ObservableObject {
     @Published public var enhancedExpenses: [EnhancedExpenseItem] = []
     @Published public var enhancedBudgets: [EnhancedBudget] = []
     @Published public var enhancedSavingsGoals: [EnhancedSavingsGoal] = []
+    @Published public var savingsEntries: [SavingsEntry] = []
     @Published public var recurringTransactions: [RecurringTransaction] = []
     @Published public var budgetAlerts: [BudgetAlert] = []
     @Published public var financialInsights: [FinancialInsight] = []
@@ -534,6 +579,7 @@ public class EnhancedDataManager: ObservableObject {
         "expenses": "ProsperlyEnhancedExpenses",
         "budgets": "ProsperlyEnhancedBudgets", 
         "goals": "ProsperlyEnhancedGoals",
+        "savings_entries": "ProsperlySavingsEntries",
         "recurring": "ProsperlyRecurringTransactions",
         "alerts": "ProsperlyBudgetAlerts"
     ]
@@ -651,6 +697,117 @@ public class EnhancedDataManager: ObservableObject {
     public func deleteSavingsGoal(_ goal: EnhancedSavingsGoal) {
         enhancedSavingsGoals.removeAll { $0.id == goal.id }
         persistData(key: "goals", data: enhancedSavingsGoals)
+        generateInsights()
+    }
+    
+    // MARK: - Savings Entries Management
+    
+    public func addSavingsAmount(_ amount: Double, to goalId: UUID, notes: String? = nil) {
+        addSavingsEntry(amount: amount, to: goalId, type: .addition, notes: notes)
+    }
+    
+    public func removeSavingsAmount(_ amount: Double, from goalId: UUID, notes: String? = nil) -> Bool {
+        // Get current goal to validate removal amount
+        guard let goalIndex = enhancedSavingsGoals.firstIndex(where: { $0.id == goalId }) else {
+            return false
+        }
+        
+        let currentGoal = enhancedSavingsGoals[goalIndex]
+        
+        // Validate that we're not removing more than current amount
+        if amount > currentGoal.currentAmount {
+            return false // Cannot remove more than current amount
+        }
+        
+        addSavingsEntry(amount: amount, to: goalId, type: .removal, notes: notes)
+        return true
+    }
+    
+    private func addSavingsEntry(amount: Double, to goalId: UUID, type: SavingsEntryType, notes: String? = nil) {
+        // Create new savings entry
+        let entry = SavingsEntry(
+            goalId: goalId,
+            amount: amount,
+            type: type,
+            date: Date(),
+            notes: notes
+        )
+        
+        // Add to entries list
+        savingsEntries.append(entry)
+        
+        // Update the goal's current amount
+        if let index = enhancedSavingsGoals.firstIndex(where: { $0.id == goalId }) {
+            var updatedGoal = enhancedSavingsGoals[index]
+            let wasCompleted = updatedGoal.isCompleted
+            
+            switch type {
+            case .addition:
+                updatedGoal.currentAmount += amount
+                // Check if goal is now completed
+                if !wasCompleted && updatedGoal.isCompleted {
+                    notificationManager.scheduleGoalCompletionNotification(for: updatedGoal)
+                }
+            case .removal:
+                updatedGoal.currentAmount = max(0, updatedGoal.currentAmount - amount)
+            }
+            
+            enhancedSavingsGoals[index] = updatedGoal
+        }
+        
+        // Persist data
+        persistData(key: "goals", data: enhancedSavingsGoals)
+        persistData(key: "savings_entries", data: savingsEntries)
+        
+        // Generate new insights
+        generateInsights()
+    }
+    
+    public func getSavingsEntries(for goalId: UUID) -> [SavingsEntry] {
+        return savingsEntries.filter { $0.goalId == goalId }.sorted { $0.date > $1.date }
+    }
+    
+    public func getSavingsEntries(for goalId: UUID, type: SavingsEntryType) -> [SavingsEntry] {
+        return savingsEntries.filter { $0.goalId == goalId && $0.type == type }.sorted { $0.date > $1.date }
+    }
+    
+    public func getTotalSavingsAmount(for goalId: UUID) -> Double {
+        let entries = getSavingsEntries(for: goalId)
+        return entries.reduce(0) { total, entry in
+            switch entry.type {
+            case .addition:
+                return total + entry.amount
+            case .removal:
+                return total - entry.amount
+            }
+        }
+    }
+    
+    public func deleteSavingsEntry(_ entry: SavingsEntry) {
+        // Remove from entries
+        savingsEntries.removeAll { $0.id == entry.id }
+        
+        // Update the goal's current amount by reversing the entry effect
+        if let index = enhancedSavingsGoals.firstIndex(where: { $0.id == entry.goalId }) {
+            var updatedGoal = enhancedSavingsGoals[index]
+            
+            switch entry.type {
+            case .addition:
+                // Reverse an addition by subtracting
+                updatedGoal.currentAmount = max(0, updatedGoal.currentAmount - entry.amount)
+            case .removal:
+                // Reverse a removal by adding back
+                updatedGoal.currentAmount += entry.amount
+            }
+            
+            enhancedSavingsGoals[index] = updatedGoal
+        }
+        
+        // Persist data
+        persistData(key: "goals", data: enhancedSavingsGoals)
+        persistData(key: "savings_entries", data: savingsEntries)
+        
+        // Generate new insights
         generateInsights()
     }
     
@@ -822,6 +979,7 @@ public class EnhancedDataManager: ObservableObject {
         enhancedExpenses = loadData(key: "expenses", type: [EnhancedExpenseItem].self) ?? []
         enhancedBudgets = loadData(key: "budgets", type: [EnhancedBudget].self) ?? []
         enhancedSavingsGoals = loadData(key: "goals", type: [EnhancedSavingsGoal].self) ?? []
+        savingsEntries = loadData(key: "savings_entries", type: [SavingsEntry].self) ?? []
         recurringTransactions = loadData(key: "recurring", type: [RecurringTransaction].self) ?? []
         budgetAlerts = loadData(key: "alerts", type: [BudgetAlert].self) ?? []
     }
@@ -830,6 +988,7 @@ public class EnhancedDataManager: ObservableObject {
         enhancedExpenses.removeAll()
         enhancedBudgets.removeAll()
         enhancedSavingsGoals.removeAll()
+        savingsEntries.removeAll()
         recurringTransactions.removeAll()
         budgetAlerts.removeAll()
         financialInsights.removeAll()

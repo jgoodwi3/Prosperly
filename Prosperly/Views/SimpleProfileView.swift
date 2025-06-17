@@ -15,7 +15,6 @@ struct SimpleProfileView: View {
     @AppStorage("currencySymbol") private var currencySymbol = "$"
     @AppStorage("monthlyBudgetReminders") private var monthlyBudgetReminders = true
     @EnvironmentObject private var analytics: SimpleAnalyticsTracker
-    @State private var showingAnalyticsDashboard = false
     
     private let currencyOptions = ["$", "€", "£", "¥", "₹"]
     var body: some View {
@@ -219,34 +218,7 @@ struct SimpleProfileView: View {
                     .background(Color.gray.opacity(0.1))
                     .cornerRadius(16)
                     
-                    // Developer Tools
-                    VStack(alignment: .leading, spacing: 16) {
-                        Label("Developer Tools", systemImage: "wrench.and.screwdriver.fill")
-                            .font(.headline)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.purple)
-                        
-                        VStack(spacing: 12) {
-                            Button(action: {
-                                analytics.track(event: "analytics_dashboard_opened", category: "settings")
-                                showingAnalyticsDashboard = true
-                            }) {
-                                HStack {
-                                    Image(systemName: "chart.bar.fill")
-                                    Text("View Analytics Dashboard")
-                                        .fontWeight(.semibold)
-                                }
-                                .frame(maxWidth: .infinity)
-                                .padding()
-                                .background(Color.purple.opacity(0.1))
-                                .foregroundColor(.purple)
-                                .cornerRadius(12)
-                            }
-                        }
-                    }
-                    .padding()
-                    .background(Color.gray.opacity(0.1))
-                    .cornerRadius(16)
+
                     
                     // App Information
                     VStack(alignment: .leading, spacing: 16) {
@@ -340,10 +312,6 @@ struct SimpleProfileView: View {
                 .padding()
             }
             .navigationTitle("Prosperly - Settings")
-            .sheet(isPresented: $showingAnalyticsDashboard) {
-                AnalyticsDashboard()
-                    .environmentObject(analytics)
-            }
             .onAppear {
                 analytics.trackScreenView("settings")
             }
